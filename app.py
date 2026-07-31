@@ -324,6 +324,7 @@ with tab_screener:
     def run_full_screen():
         t_start = time.time()
         placeholder = st.empty()
+        progress_bar = st.progress(0)
 
         def show_msg(i):
             placeholder.info(_LOADING_MESSAGES[i % len(_LOADING_MESSAGES)])
@@ -342,6 +343,9 @@ with tab_screener:
                 r = fut.result()
                 r["Company Name"] = name_map.get(sym, "")
                 rows.append(r)
+                # Fundamentals stage fills the bar up to 85%; the last 15%
+                # is reserved for the technicals stage below.
+                progress_bar.progress(min(int(i / len(symbols) * 85), 85))
                 if time.time() - last_switch > 2.5:
                     msg_idx += 1
                     show_msg(msg_idx)
@@ -360,6 +364,7 @@ with tab_screener:
         df_tech = None
         if not df_sound.empty:
             show_msg(msg_idx + 1)
+            progress_bar.progress(90)
             tech_results = get_technicals_batch(list(df_sound["Symbol"]))
             tech_rows = [dict(t, Symbol=s) for s, t in tech_results.items()]
             df_tech = df_sound.merge(pd.DataFrame(tech_rows), on="Symbol", how="left")
@@ -370,7 +375,9 @@ with tab_screener:
             df_tech["Green Hits"] = hits.sum(axis=1)
             df_tech = df_tech.sort_values("Green Hits", ascending=False).reset_index(drop=True)
 
+        progress_bar.progress(100)
         placeholder.empty()
+        progress_bar.empty()
 
         st.session_state.result = {"df_all": df_all, "df_sound": df_sound, "df_tech": df_tech}
         save_daily_result({"df_all": df_all, "df_sound": df_sound, "df_tech": df_tech})
