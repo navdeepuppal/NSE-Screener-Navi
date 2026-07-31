@@ -1,0 +1,11 @@
+{
+  "Symbol": "URBANCO",
+  "NSE Ticker": "URBANCO.NS",
+  "Market Cap (Cr)": NaN,
+  "ROCE (%)": NaN,
+  "Sales Growth (%)": NaN,
+  "Profit Growth (%)": NaN,
+  "Debt to Equity": NaN,
+  "Promoter Holding (%)": NaN,
+  "_error": "Failed to perform, curl: (28) Connection timed out after 1048937 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details."
+}
