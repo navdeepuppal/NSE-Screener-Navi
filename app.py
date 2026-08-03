@@ -25,8 +25,23 @@ from nse500_screener import (
     CONDITION_MAP, write_excel, MAX_WORKERS,
     load_daily_result, save_daily_result,
     get_crypto_screener, load_crypto_result, save_crypto_result,
-    get_watchlist_batch,
 )
+try:
+    from nse500_screener import get_watchlist_batch
+except ImportError:
+    from nse500_screener import get_watchlist_technicals
+
+    def get_watchlist_batch(symbols, suffix=".NS", max_workers=8):
+        results = {}
+        if not symbols:
+            return results
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(symbols))) as pool:
+            futures = {pool.submit(get_watchlist_technicals, s, suffix): s for s in symbols}
+            for fut in as_completed(futures):
+                data = fut.result()
+                results[data["Symbol"]] = data
+        return results
+
 import db
 
 db.init_db()
