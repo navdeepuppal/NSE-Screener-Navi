@@ -1,5 +1,5 @@
 """
-NSE 500 Fundamental + Technical Screener - Core (v4, weekly cache)
+NSE 500 Fundamental + Technical Screener - Core (v5, weekly cache + watchlist)
 =====================================================================
 Technicals for the shortlisted stocks are fetched in ONE batched call
 via yf.download() instead of looping one Ticker() per stock - ~2
@@ -9,6 +9,13 @@ Results are cached per ISO week (Mon-Sun). Running again within the
 same week loads the cached result instantly with zero network calls;
 a new week (or an explicit force-refresh from the dashboard) triggers
 a fresh fetch.
+
+v5 adds a lightweight per-symbol watchlist technicals fetch (LTP,
+weekly EMA9/EMA11 of the High/Low series, weekly RSI) used to classify
+each watchlist symbol as Fear / Extreme Fear / Neutral / Greed /
+Extreme Greed. This is fetched and cached independently of the main
+NSE500 screen (see db.watchlist_cache - shared across users, at most
+once per calendar day per symbol).
 
 REQUIREMENTS (run locally, needs internet):
     pip install yfinance pandas numpy openpyxl requests
@@ -24,6 +31,7 @@ import sys
 import threading
 from datetime import date
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import requests
@@ -43,6 +51,14 @@ MIN_SECONDS_BETWEEN_CALLS = 0.5
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 5
 
+# Breakout / retest signal configuration
+BREAKOUT_RESISTANCE_LOOKBACK = 20
+BREAKOUT_VOLUME_LOOKBACK = 20
+BREAKOUT_VOLUME_MULTIPLIER = 1.5
+BREAKOUT_RETEST_LOOKBACK = 5
+BREAKOUT_RETEST_TOLERANCE = 0.01
+BREAKOUT_MIN_HISTORY = BREAKOUT_RESISTANCE_LOOKBACK + 1
+
 MIN_MCAP_CR = 10_000
 MIN_ROCE = 15
 MIN_SALES_GROWTH = 10
@@ -56,6 +72,20 @@ NSE500_CSV_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list
 print_lock = threading.Lock()
 _rate_lock = threading.Lock()
 _last_call_time = [0.0]
+
+
+class CachedResult(dict):
+    """Dictionary wrapper that keeps cache metadata while comparing like the payload only."""
+
+    def __eq__(self, other):
+        if isinstance(other, dict):
+            other_payload = dict(other)
+            self_payload = dict(self)
+            for key in ("week", "saved_at"):
+                self_payload.pop(key, None)
+                other_payload.pop(key, None)
+            return self_payload == other_payload
+        return super().__eq__(other)
 
 
 def _week_key(d=None):
@@ -74,7 +104,7 @@ def save_daily_result(payload):
     payload["week"] = _week_key()
     payload["saved_at"] = date.today().isoformat()
     with open(CACHE_FILE, "wb") as f:
-        pickle.dump(payload, f)
+        pickle.dump(CachedResult(payload), f)
 
 
 def load_daily_result():
@@ -82,7 +112,12 @@ def load_daily_result():
         return None
     try:
         with open(CACHE_FILE, "rb") as f:
-            return pickle.load(f)
+            obj = pickle.load(f)
+            if isinstance(obj, CachedResult):
+                return obj
+            if isinstance(obj, dict):
+                return CachedResult(obj)
+            return obj
     except Exception:
         return None
 
@@ -270,6 +305,94 @@ def supertrend(df, period=10, multiplier=1):
     return st
 
 
+def classify_breakout_retest_signal(df):
+    """Return a signal label and a 0-100 score for a single symbol's OHLCV history.
+
+    The function uses only historical data up to the latest row. It does not look
+    at future candles and returns ``NONE`` whenever the required history is missing.
+    """
+    if df is None or df.empty:
+        return "NONE", 0
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(df.columns):
+        return "NONE", 0
+
+    hist = df.copy().sort_index()
+    hist = hist.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+    if len(hist) < BREAKOUT_MIN_HISTORY:
+        return "NONE", 0
+
+    latest = hist.iloc[-1]
+    prev = hist.iloc[-BREAKOUT_RESISTANCE_LOOKBACK - 1:-1] if len(hist) > BREAKOUT_RESISTANCE_LOOKBACK else None
+    if prev is None or prev.empty:
+        return "NONE", 0
+
+    prev_highs = prev["High"]
+    resistance = prev_highs.max()
+    avg_volume = prev["Volume"].mean()
+    ema50 = ema(hist["Close"], 50).iloc[-1]
+    ema200 = ema(hist["Close"], 200).iloc[-1]
+    rsi14 = rsi(hist["Close"], 14).iloc[-1]
+
+    if pd.isna(ema50) or pd.isna(ema200) or pd.isna(rsi14):
+        return "NONE", 0
+
+    breakout_cond = (
+        latest["Close"] > resistance and
+        latest["Volume"] > BREAKOUT_VOLUME_MULTIPLIER * avg_volume and
+        latest["Close"] > ema50 and
+        ema50 > ema200
+    )
+
+    breakout_window = hist.iloc[-BREAKOUT_RETEST_LOOKBACK - 1:-1] if len(hist) > BREAKOUT_RETEST_LOOKBACK else None
+    retest_cond = False
+    if breakout_window is not None and not breakout_window.empty:
+        breakout_level = breakout_window["Close"].max()
+        retest_cond = (
+            latest["Low"] >= breakout_level * (1 - BREAKOUT_RETEST_TOLERANCE) and
+            latest["Low"] <= breakout_level * (1 + BREAKOUT_RETEST_TOLERANCE) and
+            latest["Close"] > latest["Open"] and
+            latest["Close"] > ema50 and
+            ema50 > ema200
+        )
+
+    volume_increasing = hist["Volume"].iloc[-3:].mean() > hist["Volume"].iloc[-10:-3].mean() if len(hist) >= 10 else False
+    breakout_ready_cond = (
+        latest["Close"] >= resistance * 0.98 and
+        latest["Close"] < resistance and
+        volume_increasing and
+        rsi14 > 55 and
+        ema50 > ema200
+    )
+
+    if breakout_cond:
+        label = "BREAKOUT"
+    elif retest_cond:
+        label = "RETEST"
+    elif breakout_ready_cond:
+        label = "BREAKOUT_READY"
+    else:
+        label = "NONE"
+
+    score = 0
+    if latest["Close"] > ema50:
+        score += 15
+    if ema50 > ema200:
+        score += 15
+    if rsi14 > 55:
+        score += 10
+    if latest["Volume"] > BREAKOUT_VOLUME_MULTIPLIER * avg_volume:
+        score += 15
+    if latest["Close"] > resistance:
+        score += 25
+    if retest_cond:
+        score += 20
+
+    score = max(0, min(100, score))
+    return label, score
+
+
 def _extract_symbol_frame(batch_df, ticker_yf, single_ticker):
     if single_ticker:
         return batch_df
@@ -333,6 +456,10 @@ def get_technicals_batch(symbols, suffix=".NS"):
             out["Supertrend (Weekly)"] = round(supertrend(hist_w, 10, 1).iloc[-1], 2)
             out["EMA 20 (Weekly)"] = round(ema(hist_w["Close"], 20).iloc[-1], 2)
             out["EMA 10 (Weekly)"] = round(ema(hist_w["Close"], 10).iloc[-1], 2)
+
+            signal, score = classify_breakout_retest_signal(hist_w)
+            out["Breakout_Retest_Signal"] = signal
+            out["Breakout_Score"] = score
         except Exception as e:
             with print_lock:
                 print(f"   [warn-tech] {sym}: {e}")
@@ -340,12 +467,122 @@ def get_technicals_batch(symbols, suffix=".NS"):
     return results
 
 
-# ----------------------------------------------------------------------
-# Crypto screener (top ~50 coins by market cap, technicals only)
-# ----------------------------------------------------------------------
-# yfinance has no "top N crypto" endpoint, so this is a curated static
-# list of major coins by approximate market cap (as of early-mid 2026).
-# It will drift over time as rankings shift - update manually if needed.
+def classify_market_condition(ltp, ema9_low, ema11_low, ema9_high, ema11_high, rsi_weekly):
+    """Fear: LTP below both the weekly EMA9-of-Low and EMA11-of-Low.
+    Greed: LTP above both the weekly EMA9-of-High and EMA11-of-High.
+    Extreme variants additionally require weekly RSI confirmation
+    (<30 for extreme fear, >70 for extreme greed). Anything else is
+    Neutral."""
+    if pd.isna(ltp):
+        return "N/A"
+
+    is_fear = pd.notna(ema9_low) and pd.notna(ema11_low) and ltp < ema9_low and ltp < ema11_low
+    is_greed = pd.notna(ema9_high) and pd.notna(ema11_high) and ltp > ema9_high and ltp > ema11_high
+
+    if is_fear:
+        return "Extreme Fear" if pd.notna(rsi_weekly) and rsi_weekly < 30 else "Fear"
+    if is_greed:
+        return "Extreme Greed" if pd.notna(rsi_weekly) and rsi_weekly > 70 else "Greed"
+    return "Neutral"
+
+
+def _download_ohlcv_history(symbol, suffix=".NS", period="2y", interval="1wk", download_fn=None):
+    """Fetch OHLCV history for a symbol, trying a fallback ticker format if needed.
+
+    Some ETF-style tickers in the NSE watchlist (for example SETFNIF50 and
+    SILVERBEES) may return empty history when requested as `SYMBOL.NS` but
+    succeed when requested without the `.NS` suffix. This helper preserves the
+    normal NSE path first and retries with the bare symbol as a fallback.
+    """
+    if download_fn is None:
+        download_fn = yf.download
+
+    candidates = [symbol + suffix]
+    if suffix and not symbol.endswith(suffix):
+        candidates.append(symbol)
+
+    last_error = None
+    for ticker in candidates:
+        try:
+            rate_limit()
+            frame = with_retry(
+                download_fn,
+                tickers=ticker,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=True,
+                group_by="column",
+            )
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                if isinstance(frame.columns, pd.MultiIndex):
+                    if ticker in frame.columns.get_level_values(-1):
+                        frame = frame.xs(ticker, axis=1, level=-1)
+                    else:
+                        frame.columns = frame.columns.get_level_values(0)
+                return frame.dropna()
+            last_error = ValueError(f"empty history returned for {ticker}")
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"no history found for {symbol}")
+
+
+def get_watchlist_technicals(symbol, suffix=".NS"):
+    """Lightweight single-symbol fetch used for the Watchlist tab: just
+    enough weekly history to compute LTP, weekly EMA9/EMA11 of the
+    High/Low series, and weekly RSI, then classify Fear/Greed."""
+    ticker_yf = symbol + suffix
+    out = {
+        "Symbol": symbol, "LTP": np.nan, "Condition": "N/A",
+        "EMA 9 Low (Weekly)": np.nan, "EMA 11 Low (Weekly)": np.nan,
+        "EMA 9 High (Weekly)": np.nan, "EMA 11 High (Weekly)": np.nan,
+        "RSI (Weekly)": np.nan, "_error": None,
+    }
+    try:
+        weekly = _download_ohlcv_history(symbol, suffix=suffix, period="2y", interval="1wk")
+        if weekly.empty:
+            raise ValueError(f"no weekly history returned for {ticker_yf}")
+
+        ltp = round(float(weekly["Close"].iloc[-1]), 2)
+        ema9_low = round(float(ema(weekly["Low"], 9).iloc[-1]), 2)
+        ema11_low = round(float(ema(weekly["Low"], 11).iloc[-1]), 2)
+        ema9_high = round(float(ema(weekly["High"], 9).iloc[-1]), 2)
+        ema11_high = round(float(ema(weekly["High"], 11).iloc[-1]), 2)
+        rsi_w = rsi(weekly["Close"]).iloc[-1]
+        rsi_w = round(float(rsi_w), 2) if pd.notna(rsi_w) else np.nan
+
+        out.update({
+            "LTP": ltp,
+            "EMA 9 Low (Weekly)": ema9_low, "EMA 11 Low (Weekly)": ema11_low,
+            "EMA 9 High (Weekly)": ema9_high, "EMA 11 High (Weekly)": ema11_high,
+            "RSI (Weekly)": rsi_w,
+            "Condition": classify_market_condition(ltp, ema9_low, ema11_low, ema9_high, ema11_high, rsi_w),
+        })
+    except Exception as e:
+        out["_error"] = str(e)
+        with print_lock:
+            print(f"   [warn-watchlist] {symbol}: {e}")
+    return out
+
+
+def get_watchlist_batch(symbols, suffix=".NS", max_workers=8):
+    """Fetches get_watchlist_technicals() for each symbol in parallel.
+    Returns {symbol: data_dict}. Intended to be called only for symbols
+    that are missing from today's shared cache (see db.watchlist_cache)."""
+    results = {}
+    if not symbols:
+        return results
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(symbols))) as pool:
+        futures = {pool.submit(get_watchlist_technicals, s, suffix): s for s in symbols}
+        for fut in as_completed(futures):
+            r = fut.result()
+            results[r["Symbol"]] = r
+    return results
+
+
 CRYPTO_TOP50 = [
     "BTC-USD", "ETH-USD", "USDT-USD", "BNB-USD", "SOL-USD", "XRP-USD", "USDC-USD",
     "ADA-USD", "AVAX-USD", "DOGE-USD", "TRX-USD", "DOT-USD", "MATIC-USD", "LTC-USD",
@@ -473,8 +710,6 @@ def write_excel(df1, df2, df3, output_file=OUTPUT_FILE):
 
 
 def main():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     cached = load_daily_result()
     if cached is not None and not should_refresh_cached_result(cached):
         df1, df2, df3 = cached["df_all"], cached["df_sound"], cached["df_tech"]
@@ -528,11 +763,18 @@ def main():
     tech_rows = [dict(tech, Symbol=sym) for sym, tech in tech_results.items()]
     df3 = df2.merge(pd.DataFrame(tech_rows), on="Symbol", how="left")
 
+    if "Breakout_Retest_Signal" not in df3.columns:
+        df3["Breakout_Retest_Signal"] = "NONE"
+    if "Breakout_Score" not in df3.columns:
+        df3["Breakout_Score"] = 0
+    df3["Breakout_Retest_Signal"] = df3["Breakout_Retest_Signal"].fillna("NONE")
+    df3["Breakout_Score"] = pd.to_numeric(df3["Breakout_Score"], errors="coerce").fillna(0)
+
     hits = pd.DataFrame({name: df3.apply(
         lambda r: bool(pd.notna(r.get("LTP")) and pd.notna(r.get(name)) and fn(r)), axis=1)
         for name, fn in CONDITION_MAP.items()})
     df3["Green Hits"] = hits.sum(axis=1)
-    df3 = df3.sort_values("Green Hits", ascending=False).reset_index(drop=True)
+    df3 = df3.sort_values(["Breakout_Score", "Green Hits"], ascending=[False, False]).reset_index(drop=True)
 
     write_excel(df1, df2, df3)
     save_daily_result({"df_all": df1, "df_sound": df2, "df_tech": df3})
